@@ -1,0 +1,126 @@
+---
+output:
+  html_document:
+    df_print: paged
+---
+
+# Data-driven identification of US communities at additional risk for COVID-19 related health conditions
+
+- Andrew Deonarine, Jerod Parrent, Chirag J Patel, Arjun K Manrai 
+- See our blog post: https://www.xy.ai/process/covid-19-communities-at-risk
+- last updated: 3/15/2020
+
+
+# Data sources used below
+
+- COVID-19 tracking: https://covidtracking.com/api/
+- CDC 500 Cities (2016-2017 estimates): https://chronicdata.cdc.gov/browse?category=500+Cities
+- XY Exposome Data Warehouse, US Census estimated (2015 5-year estimate): https://www.census.gov/programs-surveys/acs
+
+
+```{r library load, echo=FALSE}
+# load libraries
+library(tidyverse)
+library(ggthemes)
+library(ggrepel)
+library(forcats)
+library(readr)
+library(DT)
+```
+
+
+# Query the Current Covid Cases in the United States
+```{r, echo=TRUE}
+# from covidtracking.com API
+current_covid <- read_csv(url('http://covidtracking.com/api/states.csv'))
+current_covid <- current_covid %>% mutate(state = fct_reorder(state, (positive)))
+p <- ggplot(current_covid, aes(state, positive))
+p <- p + geom_point() + coord_flip()
+p <- p + theme_fivethirtyeight() + theme(axis.title = element_text(), legend.position = 'none', axis.text = element_text(size=8)) + labs(y='Positive Cases', x='State')
+p
+
+p <- ggplot(current_covid, aes((positive+negative), I((positive/(positive+negative))*100), label=state))
+p <- p + geom_text(size=3) + ylab('Fraction Positive') + xlab('Total Tested') + scale_x_log10()
+p <- p + theme_fivethirtyeight() + theme(axis.title = element_text(), legend.position = 'none') + labs(x='Total Tested', y='Percent Positive of Those Tested')
+p
+
+datatable(current_covid %>% arrange(desc(positive)))
+
+```
+
+
+## Load in the 500 Cities Data, merged with EDW on a census-tract level
+```{r get data from EDW, echo=TRUE}
+fh_cities <- read_csv('fh_cities_census.csv')
+head(fh_cities)
+```
+
+
+## Community Comorbidity Risk Score: a function of  Cancer, Stroke, Asthma, COPD, CHD, Obesity, Smoking, and Diabetes
+
+```{r, echo=TRUE}
+
+fh_cities <- fh_cities %>% mutate(comorbidity_risk_score = (CANCER_CrudePrev + STROKE_CrudePrev + CASTHMA_CrudePrev + COPD_CrudePrev + CHD_CrudePrev + OBESITY_CrudePrev + CSMOKING_CrudePrev + DIABETES_CrudePrev))
+fh_cities <- fh_cities %>% filter(population_2010 > median(fh_cities$population_2010)) # filter by high population census tracts
+fh_cities$comorbidity_risk_score <- scale(fh_cities$comorbidity_risk_score) # z-score the risk score
+fh_cities <- fh_cities %>% filter(!is.na(median_age)) 
+# top census tracts per state, but filtered for those that have a high risk score
+top_per_state <- fh_cities %>% group_by(stateabbr) %>% top_n(1,comorbidity_risk_score) %>% ungroup() %>% filter(comorbidity_risk_score >= 2.5)
+# top census tracts per state based on age, but filtered for those that have a high risk score
+oldest_tracts <- fh_cities %>% group_by(stateabbr) %>% top_n(1,median_age) %>% ungroup() %>% filter(median_age >= 50)
+top_both <- fh_cities %>% filter(comorbidity_risk_score > 2 & median_age >= 55)
+
+### main plot 
+p <- ggplot(fh_cities, aes(median_age, comorbidity_risk_score))
+p <- p + geom_point(alpha=0.5, color='gray')
+
+p <- p + geom_point(data=top_per_state, aes(median_age, comorbidity_risk_score, size=population_2010))
+p <- p + geom_text_repel(data=top_per_state, aes(median_age, comorbidity_risk_score, label=paste(placename, stateabbr)), size=3)
+
+p <- p + geom_point(data=oldest_tracts, aes(median_age, comorbidity_risk_score, size=population_2010), color='red')
+p <- p + geom_text_repel(data=oldest_tracts, aes(median_age, comorbidity_risk_score, label=paste(placename, stateabbr)),color='red', size=3)
+
+
+p <- p + theme_fivethirtyeight() + theme(axis.title = element_text(), legend.position = 'none') + labs(x = 'Median Age of Tract', y = 'Comorbidity Risk Score')
+p
+
+
+```
+
+## Comorbidity Risk Score and Lack of Access To Care
+```{r, echo=TRUE}
+lack_access <- fh_cities %>% filter(comorbidity_risk_score >= 3, ACCESS2_CrudePrev > 25)
+p <- ggplot(fh_cities, aes(ACCESS2_CrudePrev, comorbidity_risk_score, size=population_2010))
+p <- p + geom_point(alpha=0.5, color='gray')
+p <- p + geom_point(data=lack_access, aes(ACCESS2_CrudePrev, comorbidity_risk_score), color='black')
+p <- p + geom_text_repel(data=lack_access, aes(ACCESS2_CrudePrev, comorbidity_risk_score, label=paste(placename, stateabbr)),color='black ', size=3)
+p <- p + theme_fivethirtyeight() + theme(axis.title = element_text(), legend.position = 'none') + labs(x = '% Lack of access to Healthcare', y = 'Comorbidity Risk Score')
+p
+```
+
+
+## Comorbidity Risk Score, Age, and High Proportion of Positive Cases
+```{r, echo=TRUE}
+fh_covid_cases <- fh_cities %>% left_join(current_covid, by=c('stateabbr'='state')) %>% mutate(covid_percent = positive / (positive+negative))
+top3_como_covid <- fh_covid_cases %>% group_by(covid_percent) %>% top_n(3, comorbidity_risk_score) %>% ungroup() %>% filter(covid_percent >= .15, total >= 100)
+p <- ggplot(fh_covid_cases %>% filter(covid_percent >= .15, total >= 100), aes(covid_percent*100, comorbidity_risk_score, size=population_2010))
+p <- p + geom_jitter(alpha=0.5, color='pink')
+p <- p + geom_text_repel(data=top3_como_covid, aes(covid_percent*100, comorbidity_risk_score, label=placename))
+p <- p + geom_label_repel(data=top3_como_covid %>% group_by(stateabbr) %>% top_n(1, comorbidity_risk_score), aes(covid_percent*100, -2, label=stateabbr), size=3)
+p <- p + theme_fivethirtyeight() + theme(axis.title = element_text(), legend.position = 'none') + labs(x = 'Percent tested positive in state [min tests of 100]', y = 'Comorbidity Risk Score')
+p
+
+top3_age_covid <- fh_covid_cases %>% group_by(covid_percent) %>% top_n(3, median_age) %>% ungroup() %>% filter(covid_percent >= .15, total >= 100)
+p <- ggplot(fh_covid_cases %>% filter(covid_percent >= .15, total >= 100), aes(covid_percent*100, median_age, size=population_2010))
+p <- p + geom_jitter(alpha=0.5, color='pink') 
+p <- p + geom_text_repel(data=top3_age_covid, aes(covid_percent*100, median_age, label=placename))
+p <- p + geom_label_repel(data=top3_age_covid %>% group_by(stateabbr) %>% top_n(1, median_age), aes(covid_percent*100, 20, label=stateabbr), size=3)
+p <- p + theme_fivethirtyeight() + theme(axis.title = element_text(), legend.position = 'none') + labs(x = 'Percent tested positive in state [min tests of 100]', y = 'Median Age')
+p
+
+```
+
+## News and social media updates on at-risk populations:
+
+- https://www.nytimes.com/2020/03/12/health/coronavirus-midlife-conditions.html
+- https://twitter.com/search?q=%23HighRiskCovid19&src=trend_click
